@@ -1,110 +1,312 @@
-# preprocessing pipeline for input images
-batch_size = 64
-num_workers = 2
+# provide some basic operators like matrix multiplication
+import numpy as np
 
-transformation = dict()
-for data_type in ("train", "test"):
-    is_train = data_type=="train"
-    transformation[data_type] = tv_transforms.Compose(([
-        tv_transforms.RandomRotation(degrees=15),
-        tv_transforms.RandomHorizontalFlip(),
-        tv_transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-        tv_transforms.RandomCrop(28, padding=4),  #random clip and fill
-    ] if is_train else []) + 
-    [
-        tv_transforms.ToTensor(),
-        tv_transforms.Normalize(mean=[0.5], std=[0.5]),
-    ])
+# base class
+class Module:
+    @property
+    def params(self): # trainable parameters
+        return []
+
+    def __call__(self, *args, **kwargs):
+        return self.forward( *args, **kwargs)
+
+# sequential module
+class Sequential(Module, list):
+    def __init__(self, *module_lst):
+        super().__init__(module_lst)
+    
+    @property
+    def params(self):
+        return sum([m.params for m in self], []) # concat all params
+    
+    def forward(self, x):
+        y = x
+        for module in self:
+            #print(module)
+            y = module(y)
+        return y
+    
+    def backward(self, dy):
+        dx = dy
+        for module in self[::-1]:
+            dx = module.backward(dx)
+        return dx
+
+class Sigmoid(Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        self.sig = 1 / (1 + np.exp(-x))
+        return self.sig
+    
+    def backward(self, dy):
+        return dy * self.sig * (1 - self.sig)
+
+class LeakyReLU(Module):
+    def __init__(self, alpha=0.01):
+        super().__init__()
+        assert alpha >= 0, "Alpha should be non-negative"
+        self.alpha = alpha
+    
+    def forward(self, x):
+        self.cache = x  
+        return np.where(x > 0, x, self.alpha * x)
+    
+    def backward(self, dy):
+        dx = np.ones_like(self.cache)
+        dx[self.cache <= 0] = self.alpha
+        return dy * dx
+
+class Linear(Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = (np.random.rand(out_features, in_features) * 2 - 1) / in_features ** 0.5
+        self.bias = np.zeros(out_features)
+        self.weight_grad = np.zeros_like(self.weight)
+        self.bias_grad = np.zeros_like(self.bias)
+
+    @property
+    def params(self):
+        return [dict(val=self.weight, grad=self.weight_grad),
+                dict(val=self.bias, grad=self.bias_grad)]
+
+    def forward(self, x):
+        self.x = x
+        return x @ self.weight.T + self.bias
+
+    def backward(self, dy):
+        self.weight_grad[:] = dy.T @ self.x
+        self.bias_grad[:] = np.sum(dy, axis=0)
+        return dy @ self.weight
+
+class Conv2d(Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        self.weight = np.random.randn(out_channels, in_channels, kernel_size, kernel_size) * np.sqrt(2. / (in_channels * kernel_size * kernel_size))
+        self.bias = np.zeros(out_channels)
+        
+        self.weight_grad = np.zeros_like(self.weight)
+        self.bias_grad = np.zeros_like(self.bias)
+
+    @property
+    def params(self):
+        return [dict(val=self.weight, grad=self.weight_grad), dict(val=self.bias, grad=self.bias_grad)]
+
+    def forward(self, x):
+        self.x = np.pad(x, ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)), mode='constant', constant_values=0)
+        
+        batch_size, _, height, width = self.x.shape
+        out_height = (height - self.kernel_size) // self.stride + 1
+        out_width = (width - self.kernel_size) // self.stride + 1
+        
+        self.y = np.zeros((batch_size, self.out_channels, out_height, out_width))
+        
+        # convolution
+        for i in range(out_height):
+            for j in range(out_width):
+                h_start = i * self.stride
+                w_start = j * self.stride
+                h_end = h_start + self.kernel_size
+                w_end = w_start + self.kernel_size
+                x_slice = self.x[:, :, h_start:h_end, w_start:w_end]
+                for k in range(self.out_channels):
+                    self.y[:, k, i, j] = np.sum(x_slice * self.weight[k, :, :, :], axis=(1, 2, 3)) + self.bias[k]
+        
+        #print(self.y)
+        return self.y
+
+    def backward(self, dy):
+        # Initialize grad
+        dx = np.zeros_like(self.x)
+        self.weight_grad[:] = 0
+        self.bias_grad[:] = 0
+        
+        # Compute grad
+        batch_size, _, out_height, out_width = dy.shape
+        for i in range(out_height):
+            for j in range(out_width):
+                h_start = i * self.stride
+                w_start = j * self.stride
+                h_end = h_start + self.kernel_size
+                w_end = w_start + self.kernel_size
+                for k in range(self.out_channels):
+                    dx[:, :, h_start:h_end, w_start:w_end] += dy[:, k:k+1, i:i+1, j:j+1] * self.weight[k, :, :, :]
+                    self.weight_grad[k, :, :, :] += np.sum(self.x[:, :, h_start:h_end, w_start:w_end] * dy[:, k:k+1, i:i+1, j:j+1], axis=0)
+                self.bias_grad[k] += np.sum(dy[:, k, i, j])
+        
+        # remove padding
+        dx = dx[:, :, self.padding:-self.padding, self.padding:-self.padding]
+        return dx
+
+class Dropout(Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.p = p  
+        self.mask = None
+
+    def forward(self, x, training=True):
+        if training:
+            self.mask = (np.random.rand(*x.shape) < self.p) / self.p
+            return x * self.mask  # 应用 mask
+        else:
+            return x
+
+    def backward(self, dy):
+        return dy * self.mask
+
+class BatchNorm2d(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        
+        # 初始化可学习参数 gamma（缩放因子）和 beta（偏移因子）
+        self.gamma = np.ones(num_features)
+        self.beta = np.zeros(num_features)
+        
+        # 初始化用于跟踪特征的均值和方差的参数
+        self.running_mean = np.zeros(num_features)
+        self.running_var = np.ones(num_features)
+        
+        # 用于存储梯度的变量
+        self.gamma_grad = np.zeros_like(self.gamma)
+        self.beta_grad = np.zeros_like(self.beta)
+
+    @property
+    def params(self):
+        return [dict(val=self.gamma, grad=self.gamma_grad), dict(val=self.beta, grad=self.beta_grad)]
+
+    def forward(self, x, training=True):
+        self.input_shape = x.shape 
+        if training:
+            batch_mean = np.mean(x, axis=(0, 2, 3), keepdims=True)
+            batch_var = np.var(x, axis=(0, 2, 3), keepdims=True)
+            
+            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean.squeeze()
+            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var.squeeze()
+            
+            self.normalized = (x - batch_mean) / np.sqrt(batch_var + self.eps)
+        else:
+            self.normalized = (x - self.running_mean.reshape(1, -1, 1, 1)) / np.sqrt(self.running_var.reshape(1, -1, 1, 1) + self.eps)
+        
+        out = self.gamma.reshape(1, -1, 1, 1) * self.normalized + self.beta.reshape(1, -1, 1, 1)
+        return out
+
+    def backward(self, dy):
+        self.gamma_grad = np.sum(dy * self.normalized, axis=(0, 2, 3))
+        self.beta_grad = np.sum(dy, axis=(0, 2, 3))
+        
+        dx_norm = dy * self.gamma.reshape(1, -1, 1, 1)
+        dx = (1. / np.sqrt(self.running_var + self.eps).reshape(1, -1, 1, 1)) * (dx_norm - np.mean(dx_norm, axis=(0, 2, 3), keepdims=True) - self.normalized * np.mean(dx_norm * self.normalized, axis=(0, 2, 3), keepdims=True))
+        
+        return dx.reshape(self.input_shape)
+
+class AvgPool2d(Module):
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+    
+    def forward(self, x):
+        self.x = x
+        n, c, h, w = x.shape
+        h_out = (h - self.kernel_size + 2 * self.padding) // self.stride + 1
+        w_out = (w - self.kernel_size + 2 * self.padding) // self.stride + 1
+        
+        x_padded = np.pad(x, ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)), mode='constant', constant_values=0)
+        
+        out = np.zeros((n, c, h_out, w_out))
+        
+        for i in range(h_out):
+            for j in range(w_out):
+                h_start = i * self.stride
+                w_start = j * self.stride
+                h_end = h_start + self.kernel_size
+                w_end = w_start + self.kernel_size
+                out[:, :, i, j] = np.mean(x_padded[:, :, h_start:h_end, w_start:w_end], axis=(2, 3))
+                
+        return out
+
+    def backward(self, dy):
+        n, c, h_out, w_out = dy.shape
+        dx = np.zeros_like(self.x)
+        
+        for i in range(h_out):
+            for j in range(w_out):
+                h_start = i * self.stride
+                w_start = j * self.stride
+                h_end = h_start + self.kernel_size
+                w_end = w_start + self.kernel_size
+                dx[:, :, h_start:h_end, w_start:w_end] += (dy[:, :, i:i+1, j:j+1] / (self.kernel_size * self.kernel_size))
+        
+        return dx
+
+class Flatten(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        self.original_shape = x.shape 
+        return x.reshape(x.shape[0], -1)  
+
+    def backward(self, dy):
+        return dy.reshape(self.original_shape)
+
+net = Sequential(
+    Conv2d(1, 32, kernel_size=3, padding=1),  # 一个卷积层，输入通道1，输出通道32
+    BatchNorm2d(32),  # 批量归一化层
+    Sigmoid(),  # 使用一个简单的激活函数来验证非线性变换
+    Flatten(),  # 展平层，为全连接层准备
+    Linear(32 * 28 * 28, 10)  # 一个简单的全连接层，输出10个分类
+)
+
+loss_fn = CrossEntropyLoss()
+
+# torch and torchvision provide some very handy utilities for dataset loading
+from torch.utils.data import DataLoader
+import torchvision.datasets as tv_datasets
+import torchvision.transforms as tv_transforms
+
+# some experimental setup
+num_epochs = 32
+batch_size = 128
+num_workers = 2
+print_every = 100
 
 # prepare datasets
 dataset, loader = {}, {}
 for data_type in ("train", "test"):
     is_train = data_type=="train"
     dataset[data_type] = tv_datasets.MNIST(
-        root="./data", train=is_train, download=True, transform=transformation[data_type],
-    )
-    loader[data_type] = torch.utils.data.DataLoader(
+        root="./data", train=is_train, download=True, 
+        transform=tv_transforms.Compose([ # preprocessing pipeline for input images
+            tv_transforms.ToTensor(),
+            tv_transforms.Normalize((0.1307,), (0.3081,)),
+    ]))
+    loader[data_type] = DataLoader(
         dataset[data_type], batch_size=batch_size, shuffle=is_train, num_workers=num_workers,
     )
 
-class BasicBlock(nn.Module):
-    expansion = 1
+optimizer = SGD(net.params)
 
-    def __init__(self, in_planes, planes, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion * planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_planes = 64
-
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.linear = nn.Linear(512 * block.expansion, num_classes)
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
-
-num_epochs = 100
-model = ResNet(BasicBlock, [2, 2, 2, 2]).to(device)
-
-# the network optimizer
-optimizer = getattr(optim, optim_name)(model.parameters(), **optim_kwargs)
-
-# loss function
-criterion = nn.CrossEntropyLoss()
-
-# training loop
 for epoch in range(num_epochs):
 
     running_loss = 0.0
     for i, (img, target) in enumerate(loader["train"]):
-        img, target = img.to(device), target.to(device)
+        loss = loss_fn(net(img), target)
 
-        pred = model(img)
-        loss = criterion(pred, target)
-
-        optimizer.zero_grad()
-        loss.backward()
+        net.backward(loss_fn.backward(loss))
         optimizer.step()
+        optimizer.zero_grad()
 
         # print statistics
         running_loss += loss.item()
@@ -113,3 +315,17 @@ for epoch in range(num_epochs):
             running_loss = 0.0
 
 print("Finished Training")
+
+# for each test image
+correct, total = 0, 0
+for img, target in loader["test"]:
+    img, target = img.numpy(), target.numpy()
+    
+    # make prediction
+    pred = net(img)
+    
+    # accumulate
+    total += len(target)
+    correct += (np.argmax(pred, axis=1) == target).sum()
+
+print(f"Accuracy of the network on the {total} test images: {100 * correct / total:.2f}%")
